@@ -1,0 +1,1031 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="theme-color" content="#4F46E5">
+<title>Split-bill-calc</title>
+
+<!-- Firebase -->
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getDatabase, ref, set, get, push, onValue, update, remove }
+  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+
+/* =====================================================================
+   🔧 FIREBASE CONFIG — Replace with your own project settings
+   ===================================================================== */
+const firebaseConfig = {
+  apiKey:            "AIzaSyBnI5VSWHCQHZrVbz_tK4SWqG36iaZpwSU",
+  authDomain:        "warikan260721.firebaseapp.com",
+  databaseURL:       "https://warikan260721-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId:         "warikan260721",
+  storageBucket:     "warikan260721.firebasestorage.app",
+  messagingSenderId: "1018878258011",
+  appId:             "1:1018878258011:web:8ed92f711756bb908b087e"
+};
+/* ===================================================================== */
+
+const app = initializeApp(firebaseConfig);
+const db  = getDatabase(app);
+
+/* ── Group ID (将来複数グループ対応できるよう /groups/{id}/ 構造) ── */
+const GROUP_ID = "default"; // 将来: URLパラメータ等から取得
+const gRef = (path) => ref(db, `groups/${GROUP_ID}/${path}`);
+
+/* ── State ── */
+let currentUser = null;   // { name, isAdmin }
+let config      = {};     // { userPin, adminPin, budget, categories }
+let members     = {};     // { id: { name, lastInputAt, lastInputBy } }
+let payments    = {};     // { id: { ... } }
+let activePage  = "login";
+let editPaymentId = null;
+
+/* ══════════════════════════════════════════════════════════════════════
+   INIT
+══════════════════════════════════════════════════════════════════════ */
+async function init() {
+  showPage("loading");
+
+  // Firebaseからconfig読み込み
+  const snap = await get(gRef("config"));
+  if (!snap.exists()) {
+    // 初回: デフォルト設定を書き込む
+    await set(gRef("config"), {
+      userPin:    "1234",
+      adminPin:   "1234",
+      budget:     0,
+      categories: ["その他","宿泊","交通費","食費","コンビニ","観光","お土産"]
+    });
+  }
+
+  // リアルタイム監視
+  onValue(gRef("config"),   snap => { config   = snap.val() || {}; renderAll(); });
+  onValue(gRef("members"),  snap => { members  = snap.val() || {}; renderAll(); });
+  onValue(gRef("payments"), snap => { payments = snap.val() || {}; renderAll(); });
+
+  // ローカルセッション復元
+  const saved = sessionStorage.getItem("sbcUser");
+  if (saved) {
+    currentUser = JSON.parse(saved);
+    showPage("main");
+  } else {
+    showPage("login");
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   PAGE ROUTER
+══════════════════════════════════════════════════════════════════════ */
+function showPage(page) {
+  activePage = page;
+  document.querySelectorAll(".page").forEach(el => el.style.display = "none");
+  const el = document.getElementById("page-" + page);
+  if (el) el.style.display = "flex";
+  if (page === "main")   renderMain();
+  if (page === "input")  renderInput();
+  if (page === "result") renderResult();
+  if (page === "admin")  renderAdmin();
+}
+
+function renderAll() {
+  if (activePage === "main")   renderMain();
+  if (activePage === "result") renderResult();
+  if (activePage === "admin")  renderAdmin();
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   LOGIN
+══════════════════════════════════════════════════════════════════════ */
+window.doLogin = function() {
+  const name = document.getElementById("loginName").value.trim();
+  const pin  = document.getElementById("loginPin").value.trim();
+  if (!name) { showToast("名前を入力してください"); return; }
+  if (!pin)  { showToast("PINを入力してください"); return; }
+  if (pin !== (config.userPin || "1234")) {
+    showToast("PINが違います");
+    document.getElementById("loginPin").value = "";
+    return;
+  }
+  currentUser = { name, isAdmin: false };
+  sessionStorage.setItem("sbcUser", JSON.stringify(currentUser));
+
+  // members に未登録なら追加
+  const existing = Object.entries(members).find(([,m]) => m.name === name);
+  if (!existing) {
+    push(gRef("members"), { name, lastInputAt: null, lastInputBy: null });
+  }
+  showPage("main");
+};
+
+window.doAdminLogin = function() {
+  const pin = document.getElementById("adminPin").value.trim();
+  if (pin !== (config.adminPin || "1234")) {
+    showToast("管理者PINが違います");
+    document.getElementById("adminPin").value = "";
+    return;
+  }
+  currentUser = { name: "管理者", isAdmin: true };
+  sessionStorage.setItem("sbcUser", JSON.stringify(currentUser));
+  showPage("admin");
+};
+
+window.doLogout = function() {
+  sessionStorage.removeItem("sbcUser");
+  currentUser = null;
+  document.getElementById("loginName").value = "";
+  document.getElementById("loginPin").value  = "";
+  showPage("login");
+};
+
+/* ══════════════════════════════════════════════════════════════════════
+   MAIN PAGE
+══════════════════════════════════════════════════════════════════════ */
+function renderMain() {
+  if (!currentUser) return;
+
+  // 予算 vs 支出
+  const budget = Number(config.budget) || 0;
+  const totalSpent = Object.values(payments).reduce((s, p) => s + Number(p.amount||0), 0);
+  const pct = budget > 0 ? Math.min(100, Math.round(totalSpent / budget * 100)) : 0;
+  const remaining = budget - totalSpent;
+  const barColor = pct >= 100 ? "var(--danger)" : pct >= 80 ? "var(--warn)" : "var(--success)";
+
+  document.getElementById("budgetSection").innerHTML = `
+    <div class="budget-row">
+      <span class="budget-label">予算</span>
+      <span class="budget-val">¥${budget.toLocaleString()}</span>
+    </div>
+    <div class="budget-row">
+      <span class="budget-label">支出合計</span>
+      <span class="budget-val" style="color:${barColor}">¥${totalSpent.toLocaleString()}</span>
+    </div>
+    <div class="progress-wrap">
+      <div class="progress-bar" style="width:${pct}%;background:${barColor}"></div>
+    </div>
+    <div class="budget-row" style="margin-top:4px">
+      <span class="budget-label" style="font-size:11px;color:var(--text3)">${pct}% 消費</span>
+      <span class="budget-label" style="font-size:11px;color:${remaining<0?'var(--danger)':'var(--text2)'}">
+        ${remaining >= 0 ? '残り ¥' + remaining.toLocaleString() : '超過 ¥' + Math.abs(remaining).toLocaleString()}
+      </span>
+    </div>
+  `;
+
+  // メンバー一覧と最終入力日時
+  const memberList = Object.entries(members).sort((a,b) => {
+    const ta = a[1].lastInputAt || 0, tb = b[1].lastInputAt || 0;
+    return tb - ta;
+  });
+
+  let memberHtml = "";
+  memberList.forEach(([id, m]) => {
+    const myTotal = Object.values(payments)
+      .filter(p => p.paidBy === m.name)
+      .reduce((s,p) => s + Number(p.amount||0), 0);
+    const lastAt = m.lastInputAt
+      ? `<span class="member-time">${fmtDateTime(m.lastInputAt)}</span>${m.lastInputBy && m.lastInputBy !== m.name ? `<span class="member-inputby">（${m.lastInputBy}が入力）</span>` : ""}`
+      : `<span class="member-time" style="color:var(--text3)">未入力</span>`;
+    const isMe = m.name === currentUser.name;
+    memberHtml += `
+      <div class="member-row ${isMe ? 'member-row-me' : ''}">
+        <div class="member-avatar" style="background:${avatarBg(m.name)};color:${avatarFg(m.name)}">${initials(m.name)}</div>
+        <div class="member-info">
+          <div class="member-name">${esc(m.name)}${isMe ? ' <span class="me-badge">自分</span>' : ''}</div>
+          <div class="member-sub">${lastAt}</div>
+        </div>
+        <div class="member-amount">¥${myTotal.toLocaleString()}</div>
+      </div>
+    `;
+  });
+  document.getElementById("memberList").innerHTML = memberList.length
+    ? memberHtml
+    : '<div style="color:var(--text3);font-size:13px;padding:12px 0">メンバーがいません</div>';
+
+  document.getElementById("currentUserName").textContent = currentUser.name;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   INPUT PAGE
+══════════════════════════════════════════════════════════════════════ */
+window.openInput = function(paymentId = null) {
+  editPaymentId = paymentId;
+  renderInput();
+  showPage("input");
+};
+
+function renderInput() {
+  if (!currentUser) return;
+  const cats = config.categories || ["その他"];
+  const catOpts = cats.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
+
+  // 支払い者（自分 or 代行）
+  const memberOpts = Object.values(members).map(m =>
+    `<option value="${esc(m.name)}" ${m.name===currentUser.name?'selected':''}>${esc(m.name)}</option>`
+  ).join("");
+
+  let editing = null;
+  if (editPaymentId && payments[editPaymentId]) editing = payments[editPaymentId];
+
+  document.getElementById("inputForm").innerHTML = `
+    <div class="form-group">
+      <label class="form-label">支払い者</label>
+      <select class="form-select" id="fPaidBy">${memberOpts}</select>
+      ${currentUser.name !== (editing?.paidBy||currentUser.name) ? '' : ''}
+    </div>
+    <div class="form-group">
+      <label class="form-label">カテゴリ</label>
+      <select class="form-select" id="fCat" onchange="toggleFNote()">${catOpts}</select>
+    </div>
+    <div class="form-group" id="fNoteGroup">
+      <label class="form-label">メモ</label>
+      <input class="form-input" type="text" id="fNote" placeholder="内容を入力（任意）" maxlength="30" value="${esc(editing?.note||'')}">
+    </div>
+    <div class="form-group">
+      <label class="form-label">金額（円）</label>
+      <div class="amount-wrap">
+        <input class="form-input amount-input" type="text" inputmode="numeric" id="fAmount"
+          placeholder="0" maxlength="9" oninput="validateFAmount(this)" value="${editing?.amount||''}">
+        <span class="yen-suffix">円</span>
+      </div>
+      <div class="err-msg" id="fAmountErr">半角数字のみ入力できます</div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">日付</label>
+      <input class="form-input" type="date" id="fDate" value="${editing?.date||todayStr()}">
+    </div>
+    ${editing ? `<div style="font-size:11px;color:var(--text3);margin-top:4px">入力者: ${esc(editing.inputBy||'')} / ${editing.inputAt ? fmtDateTime(editing.inputAt) : ''}</div>` : ''}
+  `;
+  if (editing) {
+    document.getElementById("fPaidBy").value = editing.paidBy || currentUser.name;
+    document.getElementById("fCat").value    = editing.category || cats[0];
+    toggleFNote();
+  }
+  document.getElementById("inputTitle").textContent = editing ? "支払いを編集" : "支払いを追加";
+  document.getElementById("deleteBtn").style.display = editing ? "flex" : "none";
+}
+
+window.toggleFNote = function() {
+  const cat = document.getElementById("fCat")?.value;
+  const grp = document.getElementById("fNoteGroup");
+  if (grp) grp.style.display = "block"; // 常に表示
+};
+
+window.validateFAmount = function(el) {
+  const raw = el.value, inv = raw.replace(/[0-9]/g, "");
+  const errEl = document.getElementById("fAmountErr");
+  if (inv.length > 0) {
+    el.classList.add("error");
+    errEl.classList.add("show");
+    el.value = raw.replace(/[^0-9]/g, "");
+  } else {
+    el.classList.remove("error");
+    errEl.classList.remove("show");
+  }
+};
+
+window.submitPayment = async function() {
+  const paidBy   = document.getElementById("fPaidBy").value;
+  const category = document.getElementById("fCat").value;
+  const note     = document.getElementById("fNote").value.trim();
+  const amountRaw= document.getElementById("fAmount").value.trim();
+  const date     = document.getElementById("fDate").value;
+
+  if (!amountRaw || !/^[0-9]+$/.test(amountRaw)) {
+    showToast("金額を正しく入力してください"); return;
+  }
+  const amount = parseInt(amountRaw);
+  if (amount <= 0) { showToast("1円以上を入力してください"); return; }
+
+  const now = Date.now();
+  const payload = { paidBy, category, note, amount, date, inputBy: currentUser.name, inputAt: now };
+
+  if (editPaymentId) {
+    await update(gRef(`payments/${editPaymentId}`), payload);
+    showToast("支払いを更新しました");
+  } else {
+    await push(gRef("payments"), payload);
+    showToast("支払いを追加しました");
+  }
+
+  // メンバーの最終入力日時を更新
+  const memberEntry = Object.entries(members).find(([,m]) => m.name === paidBy);
+  if (memberEntry) {
+    await update(gRef(`members/${memberEntry[0]}`), { lastInputAt: now, lastInputBy: currentUser.name });
+  }
+
+  editPaymentId = null;
+  showPage("main");
+};
+
+window.deletePayment = async function() {
+  if (!editPaymentId) return;
+  if (!confirm("この支払いを削除しますか？")) return;
+  await remove(gRef(`payments/${editPaymentId}`));
+  showToast("削除しました");
+  editPaymentId = null;
+  showPage("main");
+};
+
+window.cancelInput = function() {
+  editPaymentId = null;
+  showPage("main");
+};
+
+/* ══════════════════════════════════════════════════════════════════════
+   HISTORY PAGE
+══════════════════════════════════════════════════════════════════════ */
+window.openHistory = function() {
+  renderHistory();
+  showPage("history");
+};
+
+function renderHistory() {
+  const sorted = Object.entries(payments).sort((a,b) => (b[1].inputAt||0) - (a[1].inputAt||0));
+  if (sorted.length === 0) {
+    document.getElementById("historyList").innerHTML =
+      '<div style="text-align:center;color:var(--text3);padding:40px 0;font-size:14px">支払い記録がありません</div>';
+    return;
+  }
+  // 日付ごとにグループ化
+  const byDate = {};
+  sorted.forEach(([id, p]) => {
+    const d = p.date || "不明";
+    if (!byDate[d]) byDate[d] = [];
+    byDate[d].push([id, p]);
+  });
+
+  let html = "";
+  Object.entries(byDate).sort((a,b) => b[0].localeCompare(a[0])).forEach(([date, list]) => {
+    const dayTotal = list.reduce((s,[,p]) => s + Number(p.amount||0), 0);
+    html += `<div class="hist-date-header">${fmtDate(date)} <span style="margin-left:auto;font-size:13px">小計 ¥${dayTotal.toLocaleString()}</span></div>`;
+    list.forEach(([id, p]) => {
+      html += `
+        <div class="hist-item" onclick="openInput('${id}')">
+          <div class="hist-item-left">
+            <div class="member-avatar sm" style="background:${avatarBg(p.paidBy)};color:${avatarFg(p.paidBy)}">${initials(p.paidBy)}</div>
+            <div>
+              <div class="hist-item-title">${esc(p.category)}${p.note ? ' · ' + esc(p.note) : ''}</div>
+              <div class="hist-item-sub">${esc(p.paidBy)}${p.inputBy !== p.paidBy ? ' <span class="proxy-badge">代行:'+esc(p.inputBy)+'</span>' : ''} · ${p.inputAt ? fmtDateTime(p.inputAt) : ''}</div>
+            </div>
+          </div>
+          <div class="hist-item-amount">¥${Number(p.amount).toLocaleString()}</div>
+        </div>
+      `;
+    });
+  });
+  document.getElementById("historyList").innerHTML = html;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   RESULT PAGE
+══════════════════════════════════════════════════════════════════════ */
+function renderResult() {
+  const memberNames = [...new Set([
+    ...Object.values(members).map(m => m.name),
+    ...Object.values(payments).map(p => p.paidBy)
+  ])].filter(Boolean);
+
+  if (memberNames.length === 0) {
+    document.getElementById("resultContent").innerHTML =
+      '<div style="text-align:center;color:var(--text3);padding:40px 0">データがありません</div>';
+    return;
+  }
+
+  const totals = {};
+  memberNames.forEach(n => totals[n] = 0);
+  Object.values(payments).forEach(p => {
+    if (p.paidBy && totals[p.paidBy] !== undefined) totals[p.paidBy] += Number(p.amount||0);
+    else if (p.paidBy) totals[p.paidBy] = Number(p.amount||0);
+  });
+
+  const total = Object.values(totals).reduce((s,v) => s+v, 0);
+  const n = memberNames.length;
+  const per = Math.floor(total / n);
+  const remainder = total - per * n;
+
+  // 精算計算
+  const balances = memberNames.map(name => ({ name, bal: totals[name] - per }));
+  const debtors   = balances.filter(b => b.bal < -0.5).map(b => ({...b, amt: Math.round(-b.bal)}));
+  const creditors = balances.filter(b => b.bal >  0.5).map(b => ({...b, amt: Math.round(b.bal)}));
+  const transfers = [];
+  let di = 0, ci = 0;
+  while (di < debtors.length && ci < creditors.length) {
+    const d = debtors[di], c = creditors[ci];
+    const move = Math.min(d.amt, c.amt);
+    if (move > 0) transfers.push({ from: d.name, to: c.name, amt: move });
+    d.amt -= move; c.amt -= move;
+    if (d.amt === 0) di++; if (c.amt === 0) ci++;
+  }
+
+  const remNote = remainder > 0 ? `<span style="font-size:11px;color:var(--text3);margin-left:6px">端数${remainder}円</span>` : "";
+
+  let html = `
+    <div class="result-metrics">
+      <div class="r-metric"><div class="r-label">支出合計</div><div class="r-val">¥${total.toLocaleString()}</div></div>
+      <div class="r-metric"><div class="r-label">1人あたり${remNote}</div><div class="r-val">¥${per.toLocaleString()}</div></div>
+      <div class="r-metric"><div class="r-label">移動回数</div><div class="r-val">${transfers.length}回</div></div>
+    </div>
+    <div class="section-title">支払い内訳</div>
+  `;
+
+  memberNames.forEach(name => {
+    const diff = totals[name] - per;
+    const cls  = diff > 0 ? "over" : diff < 0 ? "under" : "even";
+    const sign = diff > 0 ? "+" : "";
+    html += `
+      <div class="breakdown-row">
+        <div class="member-avatar sm" style="background:${avatarBg(name)};color:${avatarFg(name)}">${initials(name)}</div>
+        <span class="br-name">${esc(name)}</span>
+        <span class="br-paid">¥${totals[name].toLocaleString()}</span>
+        <span class="br-diff ${cls}">${sign}${diff.toLocaleString()}</span>
+      </div>`;
+  });
+
+  html += `<div class="section-title" style="margin-top:16px">お金の移動</div>`;
+  if (transfers.length === 0) {
+    html += `<div class="no-transfer">✅ 全員均等です。移動なし</div>`;
+  } else {
+    transfers.forEach(t => {
+      html += `
+        <div class="transfer-row">
+          <div class="member-avatar sm" style="background:${avatarBg(t.from)};color:${avatarFg(t.from)}">${initials(t.from)}</div>
+          <div class="t-arrow-wrap">
+            <div class="t-amount">¥${t.amt.toLocaleString()}</div>
+            <div class="t-line"></div>
+          </div>
+          <div class="member-avatar sm" style="background:${avatarBg(t.to)};color:${avatarFg(t.to)}">${initials(t.to)}</div>
+        </div>`;
+    });
+  }
+
+  // シェアテキスト
+  const shareLines = [
+    "[Split-bill-calc]",
+    `合計: ¥${total.toLocaleString()}  1人あたり: ¥${per.toLocaleString()}`,
+    "",
+    "■ 内訳",
+    ...memberNames.map(n => `  ${n}：¥${totals[n].toLocaleString()}`),
+    "",
+    "■ お金の移動",
+    ...(transfers.length === 0
+      ? ["  移動なし"]
+      : transfers.map(t => `  ${t.from} → ${t.to}：¥${t.amt.toLocaleString()}`))
+  ].join("\n");
+  document.getElementById("shareTextArea").value = shareLines;
+
+  document.getElementById("resultContent").innerHTML = html;
+}
+
+window.copyShare = async function() {
+  const text = document.getElementById("shareTextArea").value;
+  try { await navigator.clipboard.writeText(text); showToast("✅ コピーしました！"); }
+  catch { showToast("コピーに失敗しました"); }
+};
+
+/* ══════════════════════════════════════════════════════════════════════
+   ADMIN PAGE
+══════════════════════════════════════════════════════════════════════ */
+function renderAdmin() {
+  // 予算
+  document.getElementById("adminBudget").value = config.budget || 0;
+
+  // PIN
+  document.getElementById("adminUserPin").value  = "";
+  document.getElementById("adminAdminPin").value = "";
+
+  // カテゴリ
+  const cats = config.categories || [];
+  document.getElementById("catList").innerHTML = cats.map((c, i) =>
+    `<div class="cat-row">
+      <input class="form-input cat-input" type="text" value="${esc(c)}" id="cat_${i}" maxlength="15">
+      <button class="icon-btn danger" onclick="removeCat(${i})">✕</button>
+    </div>`
+  ).join("");
+
+  // メンバー
+  const mList = Object.entries(members);
+  document.getElementById("adminMemberList").innerHTML = mList.length ? mList.map(([id, m]) =>
+    `<div class="cat-row">
+      <span style="flex:1;font-size:14px">${esc(m.name)}</span>
+      <button class="icon-btn danger" onclick="removeMember('${id}','${esc(m.name)}')">削除</button>
+    </div>`
+  ).join("") : '<div style="color:var(--text3);font-size:13px">メンバーなし</div>';
+}
+
+window.saveBudget = async function() {
+  const v = parseInt(document.getElementById("adminBudget").value) || 0;
+  await update(gRef("config"), { budget: v });
+  showToast("予算を保存しました");
+};
+
+window.saveUserPin = async function() {
+  const v = document.getElementById("adminUserPin").value.trim();
+  if (!v || v.length < 4) { showToast("4文字以上のPINを入力してください"); return; }
+  await update(gRef("config"), { userPin: v });
+  showToast("ユーザーPINを変更しました");
+  document.getElementById("adminUserPin").value = "";
+};
+
+window.saveAdminPin = async function() {
+  const v = document.getElementById("adminAdminPin").value.trim();
+  if (!v || v.length < 4) { showToast("4文字以上のPINを入力してください"); return; }
+  await update(gRef("config"), { adminPin: v });
+  showToast("管理者PINを変更しました");
+  document.getElementById("adminAdminPin").value = "";
+};
+
+window.saveCats = async function() {
+  const cats = config.categories || [];
+  const newCats = cats.map((_, i) => document.getElementById(`cat_${i}`)?.value.trim()).filter(Boolean);
+  await update(gRef("config"), { categories: newCats });
+  showToast("カテゴリを保存しました");
+};
+
+window.addCat = async function() {
+  const inp = document.getElementById("newCatInput");
+  const val = inp.value.trim();
+  if (!val) { showToast("カテゴリ名を入力してください"); return; }
+  const cats = [...(config.categories || []), val];
+  await update(gRef("config"), { categories: cats });
+  inp.value = "";
+  showToast(`「${val}」を追加しました`);
+};
+
+window.removeCat = async function(idx) {
+  const cats = [...(config.categories || [])];
+  cats.splice(idx, 1);
+  await update(gRef("config"), { categories: cats });
+};
+
+window.removeMember = async function(id, name) {
+  if (!confirm(`「${name}」を削除しますか？支払いデータは残ります。`)) return;
+  await remove(gRef(`members/${id}`));
+  showToast(`「${name}」を削除しました`);
+};
+
+window.clearAllPayments = async function() {
+  if (!confirm("全ての支払いデータを削除しますか？この操作は元に戻せません。")) return;
+  await remove(gRef("payments"));
+  showToast("支払いデータを全削除しました");
+};
+
+window.adminLogout = function() {
+  sessionStorage.removeItem("sbcUser");
+  currentUser = null;
+  showPage("login");
+};
+
+/* ══════════════════════════════════════════════════════════════════════
+   UTILS
+══════════════════════════════════════════════════════════════════════ */
+const AVATAR_PALETTE = [
+  ["#EEF2FF","#4338CA"],["#ECFDF5","#065F46"],["#FFF7ED","#9A3412"],
+  ["#FDF2F8","#9D174D"],["#EFF6FF","#1E40AF"],["#F0FDF4","#166534"],
+  ["#FFFBEB","#92400E"],["#FEF2F2","#991B1B"],["#F5F3FF","#5B21B6"],["#ECFEFF","#155E75"]
+];
+function avatarIdx(name) {
+  let h = 0; for (const c of (name||"")) h = (h * 31 + c.charCodeAt(0)) & 0xff;
+  return h % AVATAR_PALETTE.length;
+}
+function avatarBg(name) { return AVATAR_PALETTE[avatarIdx(name)][0]; }
+function avatarFg(name) { return AVATAR_PALETTE[avatarIdx(name)][1]; }
+function initials(name) { return (name||"?").slice(0,2); }
+function esc(s) { return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+function todayStr() { return new Date().toISOString().slice(0,10); }
+function fmtDateTime(ts) {
+  const d = new Date(ts);
+  return `${d.getMonth()+1}/${d.getDate()} ${String(d.getHours()).padStart(2,"0")}:${String(d.getMinutes()).padStart(2,"0")}`;
+}
+function fmtDate(str) {
+  if (!str || str === "不明") return str;
+  const [y,m,d] = str.split("-");
+  return `${y}年${parseInt(m)}月${parseInt(d)}日`;
+}
+
+let toastTimer;
+function showToast(msg) {
+  const t = document.getElementById("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove("show"), 2500);
+}
+
+// expose for inline HTML
+window.showPage = showPage;
+window.showToast = showToast;
+window.openHistory = openHistory;
+window.renderHistory = renderHistory;
+
+// start
+init();
+</script>
+
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&family=DM+Mono:wght@500&display=swap');
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --accent:#4F46E5;--accent-light:#EEF2FF;--accent-dark:#3730A3;
+  --success:#059669;--success-light:#ECFDF5;
+  --danger:#DC2626;--danger-light:#FEF2F2;
+  --warn:#D97706;--warn-light:#FFFBEB;
+  --bg:#F8F7FF;--surface:#fff;--surface2:#F3F4F6;
+  --border:#E5E7EB;--text:#111827;--text2:#6B7280;--text3:#9CA3AF;
+  --radius:14px;--radius-sm:8px;
+  --shadow:0 1px 3px rgba(0,0,0,.08),0 1px 2px rgba(0,0,0,.04);
+  --shadow-md:0 4px 12px rgba(79,70,229,.12);
+}
+body{font-family:'Noto Sans JP',sans-serif;background:var(--bg);color:var(--text);min-height:100dvh;padding-bottom:env(safe-area-inset-bottom)}
+
+/* ── pages ── */
+.page{display:none;flex-direction:column;min-height:100dvh}
+
+/* ── header ── */
+.app-header{background:var(--accent);color:#fff;padding:14px 16px;padding-top:calc(14px + env(safe-area-inset-top));display:flex;align-items:center;gap:10px;position:sticky;top:0;z-index:100;box-shadow:0 2px 8px rgba(79,70,229,.25)}
+.app-header h2{font-size:17px;font-weight:700;flex:1}
+.hdr-btn{background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.3);color:#fff;border-radius:var(--radius-sm);padding:6px 12px;font-size:13px;font-weight:500;font-family:inherit;cursor:pointer;white-space:nowrap;display:flex;align-items:center;gap:4px}
+.hdr-btn:active{background:rgba(255,255,255,.28)}
+
+/* ── scroll main ── */
+.page-body{flex:1;overflow-y:auto;padding:14px;max-width:520px;width:100%;margin:0 auto}
+
+/* ── bottom nav ── */
+.bottom-nav{background:var(--surface);border-top:1px solid var(--border);display:flex;padding:8px 0;padding-bottom:calc(8px + env(safe-area-inset-bottom));position:sticky;bottom:0;z-index:99}
+.nav-btn{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;border:none;background:none;cursor:pointer;color:var(--text3);font-size:10px;font-family:inherit;padding:4px 0;transition:color .15s}
+.nav-btn.active{color:var(--accent)}
+.nav-btn svg{width:22px;height:22px}
+
+/* ── card ── */
+.card{background:var(--surface);border-radius:var(--radius);box-shadow:var(--shadow);padding:14px;margin-bottom:12px}
+.card-title{font-size:12px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.6px;margin-bottom:10px;display:flex;align-items:center;gap:6px}
+.section-title{font-size:12px;font-weight:700;color:var(--text2);letter-spacing:.5px;text-transform:uppercase;margin-bottom:8px}
+
+/* ── login ── */
+#page-login{justify-content:center;align-items:center;padding:24px 20px;padding-top:calc(24px + env(safe-area-inset-top))}
+.login-card{background:var(--surface);border-radius:20px;box-shadow:0 8px 32px rgba(79,70,229,.15);padding:28px 24px;width:100%;max-width:380px}
+.login-logo{text-align:center;margin-bottom:20px}
+.login-logo h1{font-size:22px;font-weight:700;color:var(--accent)}
+.login-logo p{font-size:12px;color:var(--text3);margin-top:3px}
+.login-divider{border:none;border-top:1px solid var(--border);margin:16px 0}
+
+/* ── form ── */
+.form-group{margin-bottom:12px}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text2);margin-bottom:5px;letter-spacing:.3px}
+.form-input,.form-select{width:100%;height:44px;border:1.5px solid var(--border);border-radius:var(--radius-sm);font-size:15px;font-family:inherit;color:var(--text);background:var(--surface);padding:0 12px;outline:none;transition:border-color .2s;appearance:none;-webkit-appearance:none}
+.form-input:focus,.form-select:focus{border-color:var(--accent)}
+.form-select{background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%236B7280' stroke-width='2'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 10px center;padding-right:32px}
+.form-input.error{border-color:var(--danger);background:var(--danger-light);color:var(--danger)}
+.err-msg{font-size:11px;color:var(--danger);margin-top:3px;display:none}
+.err-msg.show{display:block}
+.amount-wrap{position:relative;display:flex;align-items:center}
+.amount-input{text-align:right;padding-right:28px;font-family:'DM Mono',monospace;font-size:16px;font-weight:500}
+.yen-suffix{position:absolute;right:10px;font-size:11px;color:var(--text3);pointer-events:none}
+
+/* ── buttons ── */
+.btn{display:flex;align-items:center;justify-content:center;gap:7px;height:48px;border-radius:var(--radius);border:none;font-size:15px;font-weight:700;font-family:inherit;cursor:pointer;transition:all .15s;width:100%}
+.btn:active{transform:scale(.98)}
+.btn-primary{background:var(--accent);color:#fff;box-shadow:var(--shadow-md)}
+.btn-primary:active{background:var(--accent-dark)}
+.btn-success{background:var(--success);color:#fff}
+.btn-danger{background:var(--danger);color:#fff}
+.btn-ghost{background:var(--surface);color:var(--text2);border:1.5px solid var(--border)}
+.btn-ghost:active{background:var(--surface2)}
+.btn-sm{height:38px;font-size:13px;border-radius:var(--radius-sm)}
+.icon-btn{height:36px;padding:0 12px;border-radius:var(--radius-sm);border:1.5px solid var(--border);background:var(--surface);font-size:13px;font-family:inherit;cursor:pointer;display:flex;align-items:center;gap:4px;white-space:nowrap;color:var(--text2)}
+.icon-btn.danger{border-color:var(--danger);color:var(--danger)}
+.icon-btn.danger:hover{background:var(--danger-light)}
+.btn-row{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}
+
+/* ── fab ── */
+.fab{position:fixed;bottom:calc(68px + env(safe-area-inset-bottom));right:20px;width:56px;height:56px;border-radius:50%;background:var(--accent);color:#fff;border:none;box-shadow:0 4px 16px rgba(79,70,229,.35);cursor:pointer;display:flex;align-items:center;justify-content:center;z-index:98;font-size:26px;transition:transform .15s}
+.fab:active{transform:scale(.92)}
+
+/* ── budget ── */
+.budget-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px}
+.budget-label{font-size:13px;color:var(--text2)}
+.budget-val{font-size:16px;font-weight:700;font-family:'DM Mono',monospace}
+.progress-wrap{height:8px;background:var(--surface2);border-radius:4px;overflow:hidden;margin:4px 0}
+.progress-bar{height:100%;border-radius:4px;transition:width .4s}
+
+/* ── member list ── */
+.member-row{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--border)}
+.member-row:last-child{border-bottom:none}
+.member-row-me{background:var(--accent-light);margin:0 -14px;padding:10px 14px;border-radius:var(--radius-sm);border-bottom:none;margin-bottom:2px}
+.member-avatar{width:36px;height:36px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;flex-shrink:0}
+.member-avatar.sm{width:30px;height:30px;font-size:11px}
+.member-info{flex:1;min-width:0}
+.member-name{font-size:14px;font-weight:600}
+.member-sub{font-size:11px;color:var(--text3);margin-top:1px;display:flex;gap:4px;align-items:center;flex-wrap:wrap}
+.member-time{color:var(--text2)}
+.member-inputby{font-size:10px;color:var(--warn)}
+.member-amount{font-size:15px;font-weight:700;font-family:'DM Mono',monospace;color:var(--accent)}
+.me-badge{font-size:10px;font-weight:500;background:var(--accent);color:#fff;border-radius:20px;padding:1px 6px;vertical-align:middle;margin-left:4px}
+.proxy-badge{font-size:10px;background:var(--warn-light);color:var(--warn);border-radius:3px;padding:1px 5px}
+
+/* ── history ── */
+.hist-date-header{font-size:12px;font-weight:700;color:var(--text2);padding:10px 0 6px;border-bottom:2px solid var(--border);margin-bottom:4px;display:flex;align-items:center}
+.hist-item{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:var(--radius-sm);cursor:pointer;transition:background .12s;border-bottom:1px solid var(--border)}
+.hist-item:active{background:var(--surface2)}
+.hist-item-left{display:flex;align-items:center;gap:8px;flex:1;min-width:0}
+.hist-item-title{font-size:14px;font-weight:500}
+.hist-item-sub{font-size:11px;color:var(--text3);margin-top:2px;display:flex;align-items:center;gap:4px}
+.hist-item-amount{font-size:15px;font-weight:700;font-family:'DM Mono',monospace;color:var(--text);white-space:nowrap}
+
+/* ── result ── */
+.result-metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:14px}
+.r-metric{background:var(--surface2);border-radius:var(--radius-sm);padding:10px 8px;text-align:center}
+.r-label{font-size:10px;color:var(--text2);font-weight:500;margin-bottom:3px}
+.r-val{font-size:17px;font-weight:700;color:var(--accent);font-family:'DM Mono',monospace}
+.breakdown-row{display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--border)}
+.breakdown-row:last-child{border-bottom:none}
+.br-name{flex:1;font-size:14px;font-weight:500}
+.br-paid{font-size:13px;color:var(--text2);font-family:'DM Mono',monospace;min-width:70px;text-align:right}
+.br-diff{font-size:13px;font-family:'DM Mono',monospace;font-weight:700;min-width:64px;text-align:right;padding:3px 8px;border-radius:20px}
+.br-diff.over{background:var(--success-light);color:var(--success)}
+.br-diff.under{background:var(--danger-light);color:var(--danger)}
+.br-diff.even{background:var(--surface2);color:var(--text2)}
+.transfer-row{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--border)}
+.transfer-row:last-child{border-bottom:none}
+.t-arrow-wrap{flex:1;display:flex;flex-direction:column;align-items:center;gap:2px}
+.t-amount{font-size:15px;font-weight:700;color:var(--accent);font-family:'DM Mono',monospace}
+.t-line{width:100%;display:flex;align-items:center;color:var(--text3)}
+.t-line::before{content:'';flex:1;height:1.5px;background:var(--border)}
+.t-line::after{content:'▶';font-size:10px;margin-left:2px}
+.no-transfer{padding:16px;text-align:center;color:var(--success);font-weight:500;font-size:14px}
+.share-area{width:100%;min-height:140px;border:1.5px solid var(--border);border-radius:var(--radius-sm);font-size:12px;font-family:'DM Mono',monospace;color:var(--text);background:var(--surface2);padding:10px;resize:none;outline:none;line-height:1.7}
+
+/* ── admin ── */
+.admin-section{background:var(--surface);border-radius:var(--radius);box-shadow:var(--shadow);padding:14px;margin-bottom:12px}
+.admin-section-title{font-size:13px;font-weight:700;color:var(--text2);margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid var(--border)}
+.cat-row{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.cat-input{flex:1;height:38px;font-size:14px}
+.add-cat-row{display:flex;gap:8px;margin-top:8px}
+.add-cat-input{flex:1;height:38px;font-size:14px}
+
+/* ── loading ── */
+#page-loading{justify-content:center;align-items:center;background:var(--bg)}
+.spinner{width:40px;height:40px;border:3px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* ── toast ── */
+.toast{position:fixed;bottom:calc(80px + env(safe-area-inset-bottom));left:50%;transform:translateX(-50%) translateY(80px);background:#1F2937;color:#fff;padding:10px 20px;border-radius:100px;font-size:13px;font-weight:500;transition:transform .3s cubic-bezier(.34,1.56,.64,1);z-index:9999;white-space:nowrap;pointer-events:none}
+.toast.show{transform:translateX(-50%) translateY(0)}
+
+::-webkit-scrollbar{width:4px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
+</style>
+</head>
+<body>
+
+<!-- ══ LOADING ══ -->
+<div class="page" id="page-loading" style="display:flex">
+  <div style="text-align:center">
+    <div class="spinner" style="margin:0 auto 16px"></div>
+    <div style="font-size:14px;color:var(--text3)">読み込み中...</div>
+  </div>
+</div>
+
+<!-- ══ LOGIN ══ -->
+<div class="page" id="page-login">
+  <div class="login-card">
+    <div class="login-logo">
+      <h1>💰 Split-bill-calc</h1>
+      <p>旅行・グループ割り勘アプリ</p>
+    </div>
+
+    <div class="form-group">
+      <label class="form-label">お名前</label>
+      <input class="form-input" type="text" id="loginName" placeholder="例：田中太郎" maxlength="10"
+        onkeydown="if(event.key==='Enter')document.getElementById('loginPin').focus()">
+    </div>
+    <div class="form-group">
+      <label class="form-label">PIN（共通）</label>
+      <input class="form-input" type="password" id="loginPin" placeholder="••••"
+        maxlength="20" inputmode="numeric"
+        onkeydown="if(event.key==='Enter')doLogin()">
+    </div>
+    <button class="btn btn-primary" onclick="doLogin()">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>
+      ログイン
+    </button>
+
+    <hr class="login-divider">
+
+    <div class="form-group">
+      <label class="form-label" style="color:var(--danger)">管理者ログイン</label>
+      <input class="form-input" type="password" id="adminPin" placeholder="管理者PIN" maxlength="20"
+        onkeydown="if(event.key==='Enter')doAdminLogin()">
+    </div>
+    <button class="btn btn-ghost btn-sm" onclick="doAdminLogin()">管理者として入る</button>
+  </div>
+</div>
+
+<!-- ══ MAIN ══ -->
+<div class="page" id="page-main">
+  <div class="app-header">
+    <div>
+      <h2>💰 Split-bill-calc</h2>
+      <div style="font-size:11px;opacity:.7;margin-top:1px">ログイン中: <span id="currentUserName"></span></div>
+    </div>
+    <button class="hdr-btn" onclick="doLogout()">ログアウト</button>
+  </div>
+
+  <div class="page-body">
+    <!-- 予算 -->
+    <div class="card">
+      <div class="card-title">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+        予算 vs 支出
+      </div>
+      <div id="budgetSection"></div>
+    </div>
+
+    <!-- メンバー -->
+    <div class="card">
+      <div class="card-title">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        メンバー
+      </div>
+      <div id="memberList"></div>
+    </div>
+  </div>
+
+  <!-- FAB: 支払い追加 -->
+  <button class="fab" onclick="openInput()" title="支払いを追加">
+    <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+  </button>
+
+  <!-- Bottom Nav -->
+  <nav class="bottom-nav">
+    <button class="nav-btn active" onclick="setNavActive(this);showPage('main')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+      ホーム
+    </button>
+    <button class="nav-btn" onclick="setNavActive(this);openHistory()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 8v4l3 3"/><path d="M3.05 11a9 9 0 1 0 .5-4"/><path d="M3 3v5h5"/></svg>
+      履歴
+    </button>
+    <button class="nav-btn" onclick="setNavActive(this);showPage('result')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
+      集計
+    </button>
+  </nav>
+</div>
+
+<!-- ══ INPUT ══ -->
+<div class="page" id="page-input">
+  <div class="app-header">
+    <button class="hdr-btn" onclick="cancelInput()">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 18 9 12 15 6"/></svg>
+      戻る
+    </button>
+    <h2 id="inputTitle">支払いを追加</h2>
+    <div style="width:56px"></div>
+  </div>
+
+  <div class="page-body">
+    <div class="card">
+      <div id="inputForm"></div>
+      <div class="btn-row" style="margin-top:16px">
+        <button class="btn btn-ghost" onclick="cancelInput()">キャンセル</button>
+        <button class="btn btn-primary" onclick="submitPayment()">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+          保存
+        </button>
+      </div>
+      <div style="margin-top:8px">
+        <button class="btn btn-danger" id="deleteBtn" style="display:none" onclick="deletePayment()">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>
+          この支払いを削除
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══ HISTORY ══ -->
+<div class="page" id="page-history">
+  <div class="app-header">
+    <button class="hdr-btn" onclick="showPage('main')">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="15 18 9 12 15 6"/></svg>
+      戻る
+    </button>
+    <h2>支払い履歴</h2>
+    <div style="width:56px"></div>
+  </div>
+  <div class="page-body">
+    <div id="historyList"></div>
+  </div>
+</div>
+
+<!-- ══ RESULT ══ -->
+<div class="page" id="page-result">
+  <div class="app-header">
+    <div style="width:56px"></div>
+    <h2>集計・精算</h2>
+    <div style="width:56px"></div>
+  </div>
+  <div class="page-body">
+    <div class="card">
+      <div id="resultContent"></div>
+    </div>
+    <div class="card">
+      <div class="card-title">シェア</div>
+      <textarea class="share-area" id="shareTextArea" readonly></textarea>
+      <button class="btn btn-primary btn-sm" style="margin-top:8px" onclick="copyShare()">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        テキストをコピー
+      </button>
+    </div>
+  </div>
+
+  <nav class="bottom-nav">
+    <button class="nav-btn" onclick="setNavActive(this);showPage('main')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+      ホーム
+    </button>
+    <button class="nav-btn" onclick="setNavActive(this);openHistory()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 8v4l3 3"/><path d="M3.05 11a9 9 0 1 0 .5-4"/><path d="M3 3v5h5"/></svg>
+      履歴
+    </button>
+    <button class="nav-btn active" onclick="setNavActive(this);showPage('result')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
+      集計
+    </button>
+  </nav>
+</div>
+
+<!-- ══ ADMIN ══ -->
+<div class="page" id="page-admin">
+  <div class="app-header">
+    <h2>⚙️ 管理者設定</h2>
+    <button class="hdr-btn" onclick="adminLogout()">ログアウト</button>
+  </div>
+  <div class="page-body">
+
+    <!-- 予算 -->
+    <div class="admin-section">
+      <div class="admin-section-title">💰 全体予算</div>
+      <div class="form-group">
+        <label class="form-label">予算金額（円）</label>
+        <input class="form-input" type="text" inputmode="numeric" id="adminBudget" placeholder="0">
+      </div>
+      <button class="btn btn-success btn-sm" onclick="saveBudget()">予算を保存</button>
+    </div>
+
+    <!-- カテゴリ -->
+    <div class="admin-section">
+      <div class="admin-section-title">🏷 カテゴリ管理</div>
+      <div id="catList"></div>
+      <div class="add-cat-row">
+        <input class="form-input add-cat-input" type="text" id="newCatInput" placeholder="新しいカテゴリ名" maxlength="15"
+          onkeydown="if(event.key==='Enter')addCat()">
+        <button class="icon-btn" onclick="addCat()">＋ 追加</button>
+      </div>
+      <button class="btn btn-primary btn-sm" style="margin-top:10px" onclick="saveCats()">カテゴリを保存</button>
+    </div>
+
+    <!-- PIN -->
+    <div class="admin-section">
+      <div class="admin-section-title">🔑 PIN設定</div>
+      <div class="form-group">
+        <label class="form-label">ユーザーPIN（変更）</label>
+        <input class="form-input" type="password" id="adminUserPin" placeholder="新しいPIN（4文字以上）" maxlength="20">
+        <button class="btn btn-ghost btn-sm" style="margin-top:6px" onclick="saveUserPin()">ユーザーPINを変更</button>
+      </div>
+      <div class="form-group">
+        <label class="form-label" style="color:var(--danger)">管理者PIN（変更）</label>
+        <input class="form-input" type="password" id="adminAdminPin" placeholder="新しい管理者PIN（4文字以上）" maxlength="20">
+        <button class="btn btn-ghost btn-sm" style="margin-top:6px" onclick="saveAdminPin()">管理者PINを変更</button>
+      </div>
+    </div>
+
+    <!-- メンバー -->
+    <div class="admin-section">
+      <div class="admin-section-title">👥 メンバー管理</div>
+      <div id="adminMemberList"></div>
+    </div>
+
+    <!-- データ -->
+    <div class="admin-section">
+      <div class="admin-section-title" style="color:var(--danger)">⚠️ データ管理</div>
+      <button class="btn btn-danger btn-sm" onclick="clearAllPayments()">全支払いデータを削除</button>
+    </div>
+
+    <div style="height:32px"></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+function setNavActive(btn) {
+  btn.closest('nav').querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+}
+</script>
+</body>
+</html>
